@@ -476,6 +476,25 @@ class PackageValidator:
             # Validate cluster references
             if not self._validate_cluster_references(tdf_file, stim_file):
                 valid = False
+            
+            # Validate video session question references
+            if not self._validate_video_session_questions(tdf_file, stim_file):
+                valid = False
+            
+            # Validate learning session clusterlist
+            if not self._validate_learning_session_clusterlist(tdf_file, stim_file):
+                valid = False
+            
+            # Validate assessment session clusterlist
+            if not self._validate_assessment_session_clusterlist(tdf_file, stim_file):
+                valid = False
+            
+            # Validate adaptive logic
+            if not self._validate_adaptive_logic(tdf_file, stim_file):
+                valid = False
+            
+            # Check for architectural mismatches (nested structure issues)
+            self._check_architectural_issues(tdf_file, stim_file)
 
         return valid
 
@@ -540,6 +559,388 @@ class PackageValidator:
 
         return list(indices)
 
+    def _validate_video_session_questions(self, tdf_file: Dict, stim_file: Dict) -> bool:
+        """Validate video session questions exist in stimulus file and have proper structure."""
+        tdf_content = tdf_file['content']
+        stim_content = stim_file['content']
+        tdf_name = tdf_file['name']
+        valid = True
+
+        # Check all units for video sessions
+        units = []
+        if 'unit' in tdf_content.get('tutor', {}):
+            unit_data = tdf_content['tutor']['unit']
+            if isinstance(unit_data, list):
+                units = unit_data
+            else:
+                units = [unit_data]
+
+        for unit_idx, unit in enumerate(units):
+            if 'videosession' not in unit:
+                continue
+
+            videosession = unit['videosession']
+            
+            # Check if questions field exists
+            if 'questions' not in videosession:
+                self.add_warning(f"TDF '{tdf_name}' unit {unit_idx} has videosession but no 'questions' array")
+                continue
+
+            questions = videosession['questions']
+            
+            # Validate questions is an array
+            if not isinstance(questions, list):
+                self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: videosession.questions must be an array, got {type(questions).__name__}")
+                valid = False
+                continue
+
+            # Validate questiontimes if present
+            if 'questiontimes' in videosession:
+                question_times = videosession['questiontimes']
+                if not isinstance(question_times, list):
+                    self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: videosession.questiontimes must be an array")
+                    valid = False
+                elif len(question_times) != len(questions):
+                    self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: videosession.questiontimes length ({len(question_times)}) doesn't match questions length ({len(questions)})")
+                    valid = False
+
+            num_clusters = len(stim_content['setspec']['clusters'])
+            
+            # Validate each question cluster exists
+            for q_idx, cluster_id in enumerate(questions):
+                if not isinstance(cluster_id, int):
+                    self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: question[{q_idx}] is not an integer (got {cluster_id})")
+                    valid = False
+                    continue
+
+                if cluster_id < 0 or cluster_id >= num_clusters:
+                    error_msg = f"TDF '{tdf_name}' unit {unit_idx}: question cluster {cluster_id} does not exist in stimulus file (has {num_clusters} clusters: 0-{num_clusters-1})"
+                    self.add_error(error_msg)
+                    print(f"  ⚠️  Video Question Issue: {error_msg}")
+                    valid = False
+                    continue
+
+                # Validate the cluster structure for video questions
+                cluster = stim_content['setspec']['clusters'][cluster_id]
+                if not self._validate_video_question_cluster(cluster, cluster_id, tdf_name, unit_idx):
+                    valid = False
+
+            # Validate checkpoint behavior
+            if 'checkpointBehavior' in videosession:
+                behavior = videosession['checkpointBehavior']
+                valid_behaviors = ['none', 'all', 'some', 'adaptive']
+                if behavior not in valid_behaviors:
+                    self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: invalid checkpointBehavior '{behavior}', must be one of {valid_behaviors}")
+                    valid = False
+
+                # Validate adaptive checkpoints
+                if behavior == 'adaptive':
+                    if 'checkpoints' not in videosession:
+                        self.add_warning(f"TDF '{tdf_name}' unit {unit_idx}: checkpointBehavior is 'adaptive' but no 'checkpoints' array defined")
+                    elif not isinstance(videosession['checkpoints'], list):
+                        self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: videosession.checkpoints must be an array")
+                        valid = False
+
+                # Validate 'some' checkpoint behavior
+                if behavior == 'some':
+                    if 'checkpointQuestions' in videosession:
+                        if not isinstance(videosession['checkpointQuestions'], list):
+                            self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: videosession.checkpointQuestions must be an array")
+                            valid = False
+                    else:
+                        # Check if stims have checkpoint property
+                        has_checkpoint_prop = False
+                        for cluster_id in questions:
+                            if cluster_id < num_clusters:
+                                cluster = stim_content['setspec']['clusters'][cluster_id]
+                                for stim in cluster.get('stims', []):
+                                    if 'checkpoint' in stim:
+                                        has_checkpoint_prop = True
+                                        break
+                        if not has_checkpoint_prop:
+                            self.add_warning(f"TDF '{tdf_name}' unit {unit_idx}: checkpointBehavior is 'some' but no checkpointQuestions array and no stims have 'checkpoint' property")
+
+        return valid
+
+    def _validate_video_question_cluster(self, cluster: Dict, cluster_id: int, tdf_name: str, unit_idx: int) -> bool:
+        """Validate a cluster intended for video questions has appropriate structure."""
+        valid = True
+
+        if 'stims' not in cluster or not cluster['stims']:
+            self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: video question cluster {cluster_id} has no stims")
+            return False
+
+        has_multiple_choice = False
+        has_text_response = False
+
+        for stim_idx, stim in enumerate(cluster['stims']):
+            # Check if it's a multiple-choice question
+            if 'response' in stim:
+                response = stim['response']
+                if isinstance(response, dict):
+                    response_type = response.get('type', 'text')
+                    
+                    # For video questions, multiple choice is recommended
+                    if response_type in ['selectone', 'selectmultiple']:
+                        has_multiple_choice = True
+                        # Validate options exist
+                        if 'options' not in response:
+                            self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: video question cluster {cluster_id}, stim {stim_idx} has type '{response_type}' but no options array")
+                            valid = False
+                        elif not isinstance(response['options'], list) or len(response['options']) < 2:
+                            self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: video question cluster {cluster_id}, stim {stim_idx} needs at least 2 options for type '{response_type}'")
+                            valid = False
+                    elif response_type == 'text' or 'correctResponse' in response:
+                        # This is a text-based response (like flashcards)
+                        has_text_response = True
+
+        # No warnings - timeline report will show response types
+
+        return valid
+
+    def _validate_learning_session_clusterlist(self, tdf_file: Dict, stim_file: Dict) -> bool:
+        """Validate learning session clusterlist format and references."""
+        tdf_content = tdf_file['content']
+        stim_content = stim_file['content']
+        tdf_name = tdf_file['name']
+        valid = True
+
+        units = []
+        if 'unit' in tdf_content.get('tutor', {}):
+            unit_data = tdf_content['tutor']['unit']
+            if isinstance(unit_data, list):
+                units = unit_data
+            else:
+                units = [unit_data]
+
+        for unit_idx, unit in enumerate(units):
+            if 'learningsession' not in unit:
+                continue
+
+            learningsession = unit['learningsession']
+            
+            if 'clusterlist' not in learningsession:
+                self.add_warning(f"TDF '{tdf_name}' unit {unit_idx} has learningsession but no 'clusterlist'")
+                continue
+
+            clusterlist = learningsession['clusterlist']
+            
+            # Must be a string
+            if not isinstance(clusterlist, str):
+                self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: learningsession.clusterlist must be a string, got {type(clusterlist).__name__}")
+                valid = False
+                continue
+
+            # Validate format (space-separated, ranges allowed like "0-60")
+            if not self._validate_clusterlist_format(clusterlist):
+                self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: learningsession.clusterlist has invalid format: '{clusterlist}'")
+                valid = False
+                continue
+
+            # Validate cluster indices exist
+            cluster_indices = self._extract_cluster_indices_from_clusterlist(clusterlist)
+            num_clusters = len(stim_content['setspec']['clusters'])
+            
+            for idx in cluster_indices:
+                if idx < 0 or idx >= num_clusters:
+                    error_msg = f"TDF '{tdf_name}' unit {unit_idx}: clusterlist references cluster {idx} which doesn't exist (valid range: 0-{num_clusters-1})"
+                    self.add_error(error_msg)
+                    print(f"  ⚠️  Learning Session Issue: {error_msg}")
+                    valid = False
+
+        return valid
+
+    def _extract_cluster_indices_from_clusterlist(self, clusterlist: str) -> List[int]:
+        """Extract cluster indices from space-separated clusterlist string (supports ranges like '0-60')."""
+        indices = set()
+        parts = clusterlist.strip().split()
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+                
+            if '-' in part:
+                # Handle range like "0-60"
+                try:
+                    start, end = part.split('-', 1)
+                    start_idx = int(start)
+                    end_idx = int(end)
+                    for i in range(start_idx, end_idx + 1):
+                        indices.add(i)
+                except (ValueError, TypeError):
+                    pass
+            else:
+                # Single number
+                try:
+                    indices.add(int(part))
+                except (ValueError, TypeError):
+                    pass
+
+        return sorted(list(indices))
+
+    def _validate_assessment_session_clusterlist(self, tdf_file: Dict, stim_file: Dict) -> bool:
+        """Validate assessment session clusterlist format and references."""
+        tdf_content = tdf_file['content']
+        stim_content = stim_file['content']
+        tdf_name = tdf_file['name']
+        valid = True
+
+        units = []
+        if 'unit' in tdf_content.get('tutor', {}):
+            unit_data = tdf_content['tutor']['unit']
+            if isinstance(unit_data, list):
+                units = unit_data
+            else:
+                units = [unit_data]
+
+        for unit_idx, unit in enumerate(units):
+            if 'assessmentsession' not in unit:
+                continue
+
+            assessmentsession = unit['assessmentsession']
+            
+            if 'clusterlist' not in assessmentsession:
+                self.add_warning(f"TDF '{tdf_name}' unit {unit_idx} has assessmentsession but no 'clusterlist'")
+                continue
+
+            clusterlist = assessmentsession['clusterlist']
+            
+            # Must be a string
+            if not isinstance(clusterlist, str):
+                self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: assessmentsession.clusterlist must be a string, got {type(clusterlist).__name__}")
+                valid = False
+                continue
+
+            # Validate format
+            if not self._validate_clusterlist_format(clusterlist):
+                self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: assessmentsession.clusterlist has invalid format: '{clusterlist}'")
+                valid = False
+                continue
+
+            # Validate cluster indices exist
+            cluster_indices = self._extract_cluster_indices_from_clusterlist(clusterlist)
+            num_clusters = len(stim_content['setspec']['clusters'])
+            
+            for idx in cluster_indices:
+                if idx < 0 or idx >= num_clusters:
+                    error_msg = f"TDF '{tdf_name}' unit {unit_idx}: assessmentsession clusterlist references cluster {idx} which doesn't exist (valid range: 0-{num_clusters-1})"
+                    self.add_error(error_msg)
+                    print(f"  ⚠️  Assessment Session Issue: {error_msg}")
+                    valid = False
+
+        return valid
+
+    def _validate_adaptive_logic(self, tdf_file: Dict, stim_file: Dict) -> bool:
+        """Validate adaptive logic syntax and cluster references."""
+        tdf_content = tdf_file['content']
+        stim_content = stim_file['content']
+        tdf_name = tdf_file['name']
+        valid = True
+
+        units = []
+        if 'unit' in tdf_content.get('tutor', {}):
+            unit_data = tdf_content['tutor']['unit']
+            if isinstance(unit_data, list):
+                units = unit_data
+            else:
+                units = [unit_data]
+
+        for unit_idx, unit in enumerate(units):
+            if 'adaptive' not in unit:
+                continue
+
+            adaptive_logic = unit['adaptive']
+            
+            if not isinstance(adaptive_logic, list):
+                self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: 'adaptive' must be an array of logic strings")
+                valid = False
+                continue
+
+            num_clusters = len(stim_content['setspec']['clusters'])
+
+            for logic_idx, logic_string in enumerate(adaptive_logic):
+                if not isinstance(logic_string, str):
+                    self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: adaptive[{logic_idx}] must be a string")
+                    valid = False
+                    continue
+
+                # Basic syntax validation
+                if not logic_string.startswith('IF'):
+                    self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: adaptive[{logic_idx}] must start with 'IF': '{logic_string}'")
+                    valid = False
+                    continue
+
+                if 'THEN' not in logic_string:
+                    self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: adaptive[{logic_idx}] must contain 'THEN': '{logic_string}'")
+                    valid = False
+                    continue
+
+                # Extract action part (after THEN)
+                parts = logic_string.split('THEN')
+                if len(parts) < 2:
+                    continue
+                    
+                action = parts[1].strip()
+                
+                # Extract cluster references from action (format: C<cluster>S<stim>)
+                import re
+                cluster_refs = re.findall(r'C(\d+)S(\d+)', action)
+                
+                for cluster_str, stim_str in cluster_refs:
+                    cluster_id = int(cluster_str)
+                    stim_id = int(stim_str)
+                    
+                    # Validate cluster exists
+                    if cluster_id < 0 or cluster_id >= num_clusters:
+                        error_msg = f"TDF '{tdf_name}' unit {unit_idx}: adaptive[{logic_idx}] references non-existent cluster C{cluster_id} (valid: 0-{num_clusters-1})"
+                        self.add_error(error_msg)
+                        print(f"  ⚠️  Adaptive Logic Issue: {error_msg}")
+                        valid = False
+                        continue
+                    
+                    # Validate stim exists in cluster
+                    cluster = stim_content['setspec']['clusters'][cluster_id]
+                    num_stims = len(cluster.get('stims', []))
+                    if stim_id < 0 or stim_id >= num_stims:
+                        error_msg = f"TDF '{tdf_name}' unit {unit_idx}: adaptive[{logic_idx}] references C{cluster_id}S{stim_id} but cluster {cluster_id} only has {num_stims} stims (0-{num_stims-1})"
+                        self.add_error(error_msg)
+                        print(f"  ⚠️  Adaptive Logic Issue: {error_msg}")
+                        valid = False
+
+                # Check for CHECKPOINT keyword with AT time specification
+                if 'CHECKPOINT' in logic_string and 'AT' not in logic_string:
+                    self.add_warning(f"TDF '{tdf_name}' unit {unit_idx}: adaptive[{logic_idx}] has CHECKPOINT but no AT time specification")
+
+        return valid
+
+    def _check_architectural_issues(self, tdf_file: Dict, stim_file: Dict):
+        """Check for architectural mismatches between stimulus structure and MoFaCTS expectations."""
+        stim_content = stim_file['content']
+        stim_name = stim_file['name']
+        
+        clusters = stim_content['setspec']['clusters']
+        
+        for cluster_idx, cluster in enumerate(clusters):
+            stims = cluster.get('stims', [])
+            if not stims:
+                continue
+            
+            for stim_idx, stim in enumerate(stims):
+                # Check for nested incorrectResponses that should be at root level
+                if 'response' in stim and isinstance(stim['response'], dict):
+                    response_obj = stim['response']
+                    if 'incorrectResponses' in response_obj and response_obj['incorrectResponses']:
+                        # Check if it's also at root (which would be correct)
+                        if 'incorrectResponses' not in stim:
+                            warning_msg = (
+                                f"Stimulus '{stim_name}' cluster {cluster_idx} stim {stim_idx}: "
+                                f"ARCHITECTURAL MISMATCH - incorrectResponses is nested in 'response' object. "
+                                f"MoFaCTS expects it at stim root level. Multiple-choice will display as text input!"
+                            )
+                            self.add_warning(warning_msg)
+                            print(f"  ⚠️  Architectural Issue: {warning_msg}")
+
     def validate_media_references(self) -> bool:
         """Validate media file references in stimulus files."""
         valid = True
@@ -562,6 +963,553 @@ class PackageValidator:
 
         return valid
 
+    def validate_session_consistency(self) -> bool:
+        """Validate consistency between session types and their requirements."""
+        valid = True
+
+        for tdf_file in self.tdf_files:
+            tdf_content = tdf_file['content']
+            tdf_name = tdf_file['name']
+
+            units = []
+            if 'unit' in tdf_content.get('tutor', {}):
+                unit_data = tdf_content['tutor']['unit']
+                if isinstance(unit_data, list):
+                    units = unit_data
+                else:
+                    units = [unit_data]
+
+            for unit_idx, unit in enumerate(units):
+                session_types = []
+                
+                if 'videosession' in unit:
+                    session_types.append('videosession')
+                if 'learningsession' in unit:
+                    session_types.append('learningsession')
+                if 'assessmentsession' in unit:
+                    session_types.append('assessmentsession')
+
+                # Warn if multiple session types in one unit
+                if len(session_types) > 1:
+                    self.add_warning(f"TDF '{tdf_name}' unit {unit_idx} has multiple session types: {', '.join(session_types)}")
+
+                # Check for video session requirements
+                if 'videosession' in unit:
+                    videosession = unit['videosession']
+                    
+                    if 'videosource' not in videosession:
+                        self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: videosession missing required 'videosource'")
+                        valid = False
+                    
+                    if 'questions' not in videosession:
+                        self.add_warning(f"TDF '{tdf_name}' unit {unit_idx}: videosession has no 'questions' array")
+                    elif 'questiontimes' not in videosession:
+                        self.add_warning(f"TDF '{tdf_name}' unit {unit_idx}: videosession has 'questions' but no 'questiontimes'")
+                    
+                    # Check for preventScrubbing without appropriate checkpoint settings
+                    if videosession.get('preventScrubbing') and not videosession.get('checkpointBehavior'):
+                        self.add_warning(f"TDF '{tdf_name}' unit {unit_idx}: preventScrubbing is true but checkpointBehavior is not set")
+
+                # Check for learning session requirements
+                if 'learningsession' in unit:
+                    learningsession = unit['learningsession']
+                    
+                    if 'clusterlist' not in learningsession:
+                        self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: learningsession missing required 'clusterlist'")
+                        valid = False
+
+                # Check for assessment session requirements
+                if 'assessmentsession' in unit:
+                    assessmentsession = unit['assessmentsession']
+                    
+                    if 'clusterlist' not in assessmentsession:
+                        self.add_error(f"TDF '{tdf_name}' unit {unit_idx}: assessmentsession missing required 'clusterlist'")
+                        valid = False
+
+        return valid
+
+    def generate_unit_timelines(self) -> Dict[str, List[Dict]]:
+        """Generate execution timelines for all units in all TDF files."""
+        timelines = {}
+        
+        for tdf_file in self.tdf_files:
+            tdf_content = tdf_file['content']
+            tdf_name = tdf_file['name']
+            
+            # Find the corresponding stimulus file
+            stim_file_name = self._get_stimulus_file_from_tdf(tdf_content)
+            stim_file = None
+            if stim_file_name:
+                stim_file = next((f for f in self.stim_files if f['name'] == stim_file_name), None)
+            
+            units = []
+            if 'unit' in tdf_content.get('tutor', {}):
+                unit_data = tdf_content['tutor']['unit']
+                if isinstance(unit_data, list):
+                    units = unit_data
+                else:
+                    units = [unit_data]
+            
+            tdf_timeline = []
+            
+            for unit_idx, unit in enumerate(units):
+                unit_timeline = self._generate_unit_timeline(unit, unit_idx, stim_file, tdf_name)
+                tdf_timeline.append(unit_timeline)
+            
+            timelines[tdf_name] = tdf_timeline
+        
+        return timelines
+
+    def _generate_unit_timeline(self, unit: Dict, unit_idx: int, stim_file: Optional[Dict], tdf_name: str) -> Dict:
+        """Generate timeline for a single unit."""
+        timeline = {
+            'unit_index': unit_idx,
+            'unit_name': unit.get('unitname', f'Unit {unit_idx}'),
+            'session_type': None,
+            'events': []
+        }
+        
+        # Determine session type
+        if 'videosession' in unit:
+            timeline['session_type'] = 'video'
+            self._add_video_timeline_events(unit, timeline, stim_file, tdf_name)
+        elif 'learningsession' in unit:
+            timeline['session_type'] = 'learning'
+            self._add_learning_timeline_events(unit, timeline, stim_file, tdf_name)
+        elif 'assessmentsession' in unit:
+            timeline['session_type'] = 'assessment'
+            self._add_assessment_timeline_events(unit, timeline, stim_file, tdf_name)
+        else:
+            # Instruction-only unit
+            timeline['session_type'] = 'instruction'
+            if 'unitinstructions' in unit:
+                timeline['events'].append({
+                    'type': 'instruction',
+                    'description': 'Display unit instructions',
+                    'details': {
+                        'has_instructions': True,
+                        'has_timer': 'timer' in unit
+                    }
+                })
+        
+        # Check for lockout
+        if 'deliveryparams' in unit:
+            dp = unit['deliveryparams']
+            if isinstance(dp, list) and len(dp) > 0:
+                dp = dp[0]
+            if isinstance(dp, dict) and 'lockoutminutes' in dp:
+                timeline['events'].insert(0, {
+                    'type': 'lockout',
+                    'description': f"Lockout period: {dp['lockoutminutes']} minutes",
+                    'details': {'duration_minutes': dp['lockoutminutes']}
+                })
+        
+        # Adaptive logic diagram (unit-level 'adaptive' rules)
+        if 'adaptive' in unit and isinstance(unit['adaptive'], list) and unit['adaptive']:
+            adaptive_rules = unit['adaptive']
+            parsed_rules = []
+            import re
+            for idx, rule in enumerate(adaptive_rules, 1):
+                if not isinstance(rule, str) or 'THEN' not in rule:
+                    parsed_rules.append({'index': idx, 'raw': rule, 'condition': None, 'actions': [], 'warning': 'Malformed rule (missing THEN or not a string)'});
+                    continue
+                parts = rule.split('THEN', 1)
+                condition = parts[0].strip()
+                action = parts[1].strip()
+                refs = re.findall(r'C(\d+)S(\d+)', action)
+                actions = []
+                for c_str, s_str in refs:
+                    try:
+                        c_id = int(c_str); s_id = int(s_str)
+                        actions.append({'cluster': c_id, 'stim': s_id})
+                    except ValueError:
+                        pass
+                parsed_rules.append({'index': idx, 'raw': rule, 'condition': condition, 'actions': actions})
+
+            # Build ASCII diagram lines
+            diagram_lines = []
+            for entry in parsed_rules:
+                idx = entry['index']
+                if entry.get('warning'):
+                    diagram_lines.append(f"Rule {idx}: [WARNING] {entry['warning']} :: {entry['raw']}")
+                    continue
+                cond = entry['condition'] or 'UNKNOWN'
+                diagram_lines.append(f"Rule {idx}: {cond}")
+                if entry['actions']:
+                    for act in entry['actions']:
+                        diagram_lines.append(f"  └─ C{act['cluster']}S{act['stim']}")
+                else:
+                    diagram_lines.append("  └─ (no cluster actions parsed)")
+
+            timeline['events'].append({
+                'type': 'adaptive_logic_diagram',
+                'description': 'Adaptive branching diagram',
+                'details': {
+                    'logic_rule_count': len(parsed_rules),
+                    'diagram_lines': diagram_lines,
+                    'raw_rules': adaptive_rules
+                }
+            })
+        
+        return timeline
+
+    def _add_video_timeline_events(self, unit: Dict, timeline: Dict, stim_file: Optional[Dict], tdf_name: str):
+        """Add timeline events for video session."""
+        videosession = unit['videosession']
+        
+        timeline['events'].append({
+            'type': 'video_start',
+            'description': 'Video playback begins',
+            'details': {
+                'video_source': videosession.get('videosource', 'N/A'),
+                'prevent_scrubbing': videosession.get('preventScrubbing', False),
+                'checkpoint_behavior': videosession.get('checkpointBehavior', 'none'),
+                'rewind_on_incorrect': videosession.get('rewindOnIncorrect', False)
+            }
+        })
+        
+        questions = videosession.get('questions', [])
+        question_times = videosession.get('questiontimes', [])
+        
+        # Pair questions with times
+        for idx, cluster_id in enumerate(questions):
+            time = question_times[idx] if idx < len(question_times) else None
+            
+            # Get question details from stim file
+            question_details = self._get_question_details(cluster_id, stim_file)
+            
+            timeline['events'].append({
+                'type': 'video_question',
+                'time_seconds': time,
+                'description': f"Video pauses for question at {time}s" if time else "Video pauses for question",
+                'details': {
+                    'cluster_index': cluster_id,
+                    'question_number': idx + 1,
+                    'total_questions': len(questions),
+                    **question_details
+                }
+            })
+        
+        # Check for adaptive logic
+        if 'adaptiveLogic' in videosession:
+            timeline['events'].append({
+                'type': 'adaptive_processing',
+                'description': 'Adaptive logic may add additional questions dynamically',
+                'details': {
+                    'logic_count': len(videosession['adaptiveLogic']),
+                    'logic_rules': videosession['adaptiveLogic']
+                }
+            })
+        
+        timeline['events'].append({
+            'type': 'video_end',
+            'description': 'Video playback completes',
+            'details': {}
+        })
+
+    def _add_learning_timeline_events(self, unit: Dict, timeline: Dict, stim_file: Optional[Dict], tdf_name: str):
+        """Add timeline events for learning session."""
+        learningsession = unit['learningsession']
+        
+        clusterlist = learningsession.get('clusterlist', '')
+        cluster_indices = self._extract_cluster_indices_from_clusterlist(clusterlist)
+        
+        timeline['events'].append({
+            'type': 'learning_start',
+            'description': 'Learning session begins',
+            'details': {
+                'cluster_count': len(cluster_indices),
+                'cluster_range': clusterlist,
+                'unit_mode': learningsession.get('unitMode', 'default'),
+                'practice_time': unit.get('deliveryparams', {}).get('practiceseconds', 'N/A')
+            }
+        })
+        
+        # List ALL clusters as questions
+        total_q = len(cluster_indices)
+        for i, cluster_id in enumerate(cluster_indices):
+            question_details = self._get_question_details(cluster_id, stim_file)
+            timeline['events'].append({
+                'type': 'learning_question',
+                'description': f"Question {i+1}/{total_q} (cluster {cluster_id})",
+                'details': {
+                    'cluster_index': cluster_id,
+                    'question_number': i+1,
+                    'total_questions': total_q,
+                    **question_details
+                }
+            })
+        
+        timeline['events'].append({
+            'type': 'learning_end',
+            'description': 'Learning session completes',
+            'details': {}
+        })
+
+    def _add_assessment_timeline_events(self, unit: Dict, timeline: Dict, stim_file: Optional[Dict], tdf_name: str):
+        """Add timeline events for assessment session."""
+        assessmentsession = unit['assessmentsession']
+        
+        clusterlist = assessmentsession.get('clusterlist', '')
+        cluster_indices = self._extract_cluster_indices_from_clusterlist(clusterlist)
+        
+        timeline['events'].append({
+            'type': 'assessment_start',
+            'description': 'Assessment session begins',
+            'details': {
+                'cluster_count': len(cluster_indices),
+                'cluster_range': clusterlist,
+                'randomize_groups': assessmentsession.get('randomizegroups', 'false')
+            }
+        })
+        
+        # List ALL clusters as questions
+        total_q = len(cluster_indices)
+        for i, cluster_id in enumerate(cluster_indices):
+            question_details = self._get_question_details(cluster_id, stim_file)
+            timeline['events'].append({
+                'type': 'assessment_question',
+                'description': f"Question {i+1}/{total_q} (cluster {cluster_id})",
+                'details': {
+                    'cluster_index': cluster_id,
+                    'question_number': i+1,
+                    'total_questions': total_q,
+                    **question_details
+                }
+            })
+        
+        timeline['events'].append({
+            'type': 'assessment_end',
+            'description': 'Assessment session completes',
+            'details': {}
+        })
+
+    def _get_question_details(self, cluster_id: int, stim_file: Optional[Dict]) -> Dict:
+        """Extract question type and answer type details from cluster."""
+        details = {
+            'response_type': 'unknown',
+            'answer_type': 'unknown',
+            'has_options': False,
+            'num_options': 0,
+            'has_media': False,
+            'media_types': [],
+            'warnings': []
+        }
+        
+        if not stim_file:
+            details['warnings'].append('⚠ Stimulus file not found')
+            return details
+        
+        try:
+            clusters = stim_file['content']['setspec']['clusters']
+            if cluster_id >= len(clusters):
+                details['warnings'].append(f'⚠ Cluster {cluster_id} does not exist (max: {len(clusters)-1})')
+                return details
+            
+            cluster = clusters[cluster_id]
+            stims = cluster.get('stims', [])
+            
+            if not stims:
+                details['warnings'].append(f'⚠ Cluster {cluster_id} has no stimuli')
+                return details
+            
+            # Analyze first stim
+            stim = stims[0]
+            
+            # Check for nested response structure issue (MoFaCTS architectural mismatch)
+            # MoFaCTS expects incorrectResponses at stim root, not nested in response object
+            if 'response' in stim and isinstance(stim['response'], dict):
+                response_obj = stim['response']
+                if 'incorrectResponses' in response_obj and response_obj['incorrectResponses']:
+                    # This is nested - check if it's also at root (which would be correct)
+                    if 'incorrectResponses' not in stim:
+                        details['warnings'].append(
+                            f"⚠ ARCHITECTURAL MISMATCH: Cluster {cluster_id} has incorrectResponses nested in 'response' object. "
+                            f"MoFaCTS expects incorrectResponses at stim root level (stim.incorrectResponses, not stim.response.incorrectResponses). "
+                            f"This will cause multiple-choice questions to display as text-input flashcards instead of showing button options."
+                        )
+            
+            # Get question text from display
+            if 'display' in stim:
+                display = stim['display']
+                
+                # Get question text
+                if 'text' in display:
+                    question_text = display['text']
+                    # Strip HTML tags for cleaner output
+                    import re
+                    question_text = re.sub('<[^<]+?>', '', question_text)
+                    # Truncate if too long
+                    if len(question_text) > 200:
+                        question_text = question_text[:200] + '...'
+                    details['question_text'] = question_text
+                
+                # Check for media
+                media_types = []
+                if 'audioSrc' in display:
+                    media_types.append('audio')
+                    details['audio_file'] = display['audioSrc']
+                if 'imgSrc' in display:
+                    media_types.append('image')
+                    details['image_file'] = display['imgSrc']
+                if 'videoSrc' in display:
+                    media_types.append('video')
+                    details['video_file'] = display['videoSrc']
+                
+                details['has_media'] = len(media_types) > 0
+                details['media_types'] = media_types
+            
+            # Check response type
+            if 'response' in stim:
+                response = stim['response']
+                if isinstance(response, dict):
+                    response_type = response.get('type', 'text')
+                    details['response_type'] = response_type
+                    
+                    if response_type in ['selectone', 'selectmultiple']:
+                        details['answer_type'] = 'multiple_choice'
+                        options = response.get('options', [])
+                        details['has_options'] = len(options) > 0
+                        details['num_options'] = len(options)
+                        
+                        if not options:
+                            details['warnings'].append(f'⚠ Multiple-choice question has no options')
+                        elif len(options) < 2:
+                            details['warnings'].append(f'⚠ Multiple-choice question needs at least 2 options (has {len(options)})')
+                        
+                        # Extract choice text
+                        if options:
+                            choices = []
+                            has_correct = False
+                            for opt in options:
+                                if isinstance(opt, dict):
+                                    choice_text = opt.get('text', opt.get('id', 'N/A'))
+                                    choice_id = opt.get('id', '')
+                                    is_correct = (choice_id == response.get('correctResponse'))
+                                    if is_correct:
+                                        has_correct = True
+                                    choices.append({
+                                        'id': choice_id,
+                                        'text': choice_text,
+                                        'correct': is_correct
+                                    })
+                                else:
+                                    choices.append({'text': str(opt), 'correct': False})
+                            details['choices'] = choices
+                            
+                            if not has_correct:
+                                details['warnings'].append(f'⚠ No option marked as correct answer')
+                    # Inferred multiple choice: text response with correctResponse + incorrectResponses
+                    elif 'correctResponse' in response:
+                        incorrect_list = response.get('incorrectResponses')
+                        if isinstance(incorrect_list, list) and len(incorrect_list) > 0:
+                            # Treat as multiple choice even though type says text
+                            details['answer_type'] = 'multiple_choice'
+                            details['has_options'] = True
+                            # Build choices: correct first, then incorrect
+                            choices = []
+                            correct_val = str(response['correctResponse'])
+                            choices.append({'id': 'correct', 'text': correct_val, 'correct': True})
+                            for idx, inc in enumerate(incorrect_list):
+                                choices.append({'id': f'inc{idx}', 'text': str(inc), 'correct': False})
+                            details['choices'] = choices
+                            details['num_options'] = len(choices)
+                            details['warnings'].append("⚠ Inferred multiple-choice (correctResponse + incorrectResponses) but response.type='text'")
+                        else:
+                            # Plain text input
+                            details['answer_type'] = 'text_input'
+                            details['correct_answer'] = str(response['correctResponse'])
+                    
+                    # Get incorrect responses if present
+                    if 'incorrectResponses' in response:
+                        incorrect = response['incorrectResponses']
+                        if isinstance(incorrect, list):
+                            details['incorrect_answers'] = incorrect[:5]  # Limit to first 5
+            
+        except (KeyError, IndexError, TypeError):
+            pass
+        
+        return details
+
+    def write_timeline_report(self, output_file: str):
+        """Write timeline report to file."""
+        timelines = self.generate_unit_timelines()
+        
+        with open(output_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("MoFaCTS PACKAGE EXECUTION TIMELINE REPORT\n")
+            f.write("=" * 80 + "\n\n")
+            
+            for tdf_name, tdf_timeline in timelines.items():
+                f.write(f"\n{'=' * 80}\n")
+                f.write(f"TDF: {tdf_name}\n")
+                f.write(f"{'=' * 80}\n\n")
+                
+                for unit_timeline in tdf_timeline:
+                    f.write(f"  Unit {unit_timeline['unit_index']}: {unit_timeline['unit_name']}\n")
+                    f.write(f"  Session Type: {unit_timeline['session_type']}\n")
+                    f.write(f"  {'-' * 76}\n\n")
+                    
+                    for event_idx, event in enumerate(unit_timeline['events'], 1):
+                        f.write(f"    [{event_idx}] {event['type'].upper()}\n")
+                        if 'time_seconds' in event and event['time_seconds'] is not None:
+                            f.write(f"        Time: {event['time_seconds']}s\n")
+                        f.write(f"        {event['description']}\n")
+                        
+                        # Write details
+                        if event['details']:
+                            details = event['details']
+                            
+                            # Display warnings prominently FIRST
+                            if 'warnings' in details and details['warnings']:
+                                f.write(f"\n        ⚠️  WARNINGS:\n")
+                                for warning in details['warnings']:
+                                    f.write(f"            {warning}\n")
+                                f.write("\n")
+                            
+                            # Handle question text specially
+                            if 'question_text' in details:
+                                f.write(f"        Question: {details['question_text']}\n")
+                            
+                            # Handle choices specially for multiple choice
+                            if 'choices' in details:
+                                f.write(f"\n        Choices:\n")
+                                for choice in details['choices']:
+                                    marker = "✓" if choice.get('correct') else " "
+                                    choice_id = choice.get('id', '')
+                                    choice_text = choice.get('text', '')
+                                    f.write(f"          [{marker}] {choice_id}: {choice_text}\n")
+                            # Adaptive logic diagram lines
+                            if 'diagram_lines' in details:
+                                f.write("\n        Adaptive Branching Diagram:\n")
+                                for line in details['diagram_lines']:
+                                    f.write(f"          {line}\n")
+                            
+                            # Handle correct answer for text input
+                            elif 'correct_answer' in details:
+                                f.write(f"\n        Expected Answer: {details['correct_answer']}\n")
+                                if 'incorrect_answers' in details:
+                                    f.write(f"        Wrong Answers: {', '.join(details['incorrect_answers'])}\n")
+                            
+                            # Write other details
+                            f.write(f"\n        Details:\n")
+                            for key, value in details.items():
+                                # Skip items we've already displayed
+                                if key in ['logic_rules', 'choices', 'question_text', 'correct_answer', 'incorrect_answers', 'warnings']:
+                                    continue
+                                
+                                if isinstance(value, list) and len(value) > 5:
+                                    f.write(f"          {key}: [{len(value)} items]\n")
+                                elif isinstance(value, str) and len(value) > 100:
+                                    f.write(f"          {key}: {value[:100]}...\n")
+                                else:
+                                    f.write(f"          {key}: {value}\n")
+                        f.write("\n")
+                    
+                    f.write("\n")
+        
+        print(f"\n✓ Timeline report written to: {output_file}")
+
     def validate(self) -> bool:
         """Run all validation checks."""
         print(f"Validating package: {self.zip_path}")
@@ -582,6 +1530,9 @@ class PackageValidator:
             return False
 
         if not self.validate_media_references():
+            return False
+        
+        if not self.validate_session_consistency():
             return False
 
         return True
@@ -604,6 +1555,8 @@ def main():
     parser = argparse.ArgumentParser(description='Validate MoFaCTS zip packages')
     parser.add_argument('zip_path', help='Path to the zip package to validate')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--timeline', action='store_true', help='Generate unit execution timeline report')
+    parser.add_argument('-o', '--output', help='Output file for timeline report (default: <package>_timeline.txt)')
     args = parser.parse_args()
 
     validator = PackageValidator(args.zip_path, args.verbose)
@@ -616,12 +1569,33 @@ def main():
             print(f"Warnings: {len(summary['warnings'])}")
             for warning in summary['warnings']:
                 print(f"  - {warning}")
+        
+        # Generate timeline if requested
+        if args.timeline:
+            output_file = args.output
+            if not output_file:
+                base_name = os.path.splitext(os.path.basename(args.zip_path))[0]
+                output_file = f"{base_name}_timeline.txt"
+            validator.write_timeline_report(output_file)
+        
     else:
         print("✗ Package validation failed!")
         summary = validator.get_summary()
         print(f"Errors: {len(summary['errors'])}")
         for error in summary['errors']:
             print(f"  - {error}")
+        
+        # Still generate timeline even on validation failure if requested
+        if args.timeline:
+            output_file = args.output
+            if not output_file:
+                base_name = os.path.splitext(os.path.basename(args.zip_path))[0]
+                output_file = f"{base_name}_timeline.txt"
+            try:
+                validator.write_timeline_report(output_file)
+            except Exception as e:
+                print(f"Warning: Could not generate timeline: {e}")
+        
         sys.exit(1)
 
 
