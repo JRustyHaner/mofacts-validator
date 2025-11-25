@@ -22,22 +22,85 @@ A comprehensive validation script for MoFaCTS zip packages that validates struct
 ## Usage
 
 ```bash
-python3 package_validator.py <zip_file_path> [-v|--verbose]
+python3 package_validator.py <zip_file_path> [options]
 ```
 
-### Arguments
+### Options
 
-- `zip_file_path`: Path to the zip package to validate
-- `-v, --verbose`: Enable verbose output during validation
+| Option | Description |
+|--------|-------------|
+| `zip_file_path` | Path to the zip package to validate (required) |
+| `-v, --verbose` | Enable verbose output showing validation progress |
+| `--timeline` | Generate a unit execution timeline report after validation |
+| `-o, --output <file>` | Specify output file for timeline report (default: `<package>_timeline.txt`) |
+| `-h, --help` | Show help message and exit |
 
 ### Examples
 
-```bash
-# Basic validation
-python3 package_validator.py my_package.zip
+#### Basic Usage
 
-# Verbose validation with detailed output
+```bash
+# Simple validation - shows only errors and warnings
+python3 package_validator.py my_package.zip
+```
+
+#### Verbose Mode
+
+```bash
+# Detailed validation with progress messages
 python3 package_validator.py my_package.zip -v
+```
+
+This shows:
+- File discovery progress
+- Which files are being validated
+- Cross-reference checks
+- Media file validation
+
+#### Timeline Reports
+
+```bash
+# Generate timeline report (default output: my_package_timeline.txt)
+python3 package_validator.py my_package.zip --timeline
+
+# Generate timeline with custom output file
+python3 package_validator.py my_package.zip --timeline -o report.txt
+
+# Verbose validation with timeline
+python3 package_validator.py my_package.zip -v --timeline
+```
+
+Timeline reports show:
+- Unit execution order and duration
+- Cluster assignments per unit
+- Assessment session details
+- Complete execution flow visualization
+
+#### Batch Validation
+
+```bash
+# Validate multiple packages
+for package in *.zip; do
+    echo "Validating $package"
+    python3 package_validator.py "$package"
+done
+
+# Validate and generate reports for all packages
+for package in *.zip; do
+    python3 package_validator.py "$package" --timeline -o "${package%.zip}_report.txt"
+done
+```
+
+#### CI/CD Integration
+
+```bash
+# Exit code is 0 on success, 1 on failure
+if python3 package_validator.py package.zip; then
+    echo "Package is valid, proceeding with deployment"
+else
+    echo "Package validation failed" >&2
+    exit 1
+fi
 ```
 
 ## What it validates
@@ -95,7 +158,147 @@ python3 package_validator.py my_package.zip -v
 - `0`: Validation successful
 - `1`: Validation failed (errors found)
 
-## Output
-    
-The script provides clear error and warning messages. In verbose mode, it shows progress during validation.
+## Output Examples
+
+### Successful Validation
+```
+✓ Package validation successful!
+Files found: {'tdf': 2, 'stim': 2, 'media': 5}
+```
+
+### Validation with Warnings
+```
+WARNING: Stimulus file 'stims.json' cluster 0 stimulus 3: Display text appears to be a question but missing incorrectResponses
+✓ Package validation successful!
+Files found: {'tdf': 1, 'stim': 1, 'media': 0}
+Warnings: 1
+  - Stimulus file 'stims.json' cluster 0 stimulus 3: Display text appears to be a question but missing incorrectResponses
+```
+
+### Failed Validation
+```
+ERROR: Stimulus file 'myStims.json' missing 'setspec' key
+ERROR: TDF file 'myTDF.json' references non-existent stimulus file 'wrongFile.json'
+✗ Package validation failed!
+Errors: 2
+  - Stimulus file 'myStims.json' missing 'setspec' key
+  - TDF file 'myTDF.json' references non-existent stimulus file 'wrongFile.json'
+```
+
+### Verbose Mode Output
+```
+Found 1 TDF files, 1 stimulus files, 3 media files
+Validating package structure...
+Validating JSON structure...
+Validating stimulus file: stims.json
+Validating TDF file: lesson.json
+Validating cross-references...
+Validating media references...
+✓ Package validation successful!
+Files found: {'tdf': 1, 'stim': 1, 'media': 3}
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**"No valid TDF-stimulus file pairs found"**
+- Ensure TDF's `stimulusfile` field matches the actual stimulus filename in the package
+- Check that both files are in the zip archive
+
+**"Invalid JSON in file"**
+- Validate your JSON syntax using a JSON validator
+- Check for missing commas, brackets, or quotes
+- Ensure proper UTF-8 encoding
+
+**"Cluster X in TDF references non-existent cluster index"**
+- Verify cluster indices in TDF match those in the stimulus file
+- Remember: cluster indices are 0-based
+
+**"Media file referenced but not found"**
+- Ensure media files referenced in stimuli are included in the zip
+- Or use HTTP/HTTPS URLs for external media
+- Check filename spelling and case sensitivity
+
+**Unicode Warning Messages**
+- Some responses contain invisible characters that will be stripped
+- Review the responses and remove any special characters
+- Use standard ASCII characters when possible
+
+## Quick Start
+
+1. **Install Python** (see Python Installation section above)
+2. **Download the validator script**
+3. **Run validation:**
+   ```bash
+   python3 package_validator.py your_package.zip
+   ```
+4. **Fix any errors** reported by the validator
+5. **Re-run** until validation succeeds
+
+## Advanced Features
+
+### Timeline Report
+
+The timeline feature generates a detailed execution flow report showing:
+
+- **Unit Order**: Visual representation of unit execution sequence
+- **Duration**: Time allocation for each unit
+- **Cluster Mapping**: Which clusters are practiced in each unit
+- **Assessment Sessions**: Special assessment unit details
+
+Example timeline output:
+```
+Unit Execution Timeline
+=======================
+Total Estimated Time: 45 minutes
+
+Unit 1 (Practice) - 10 minutes
+  Clusters: 0, 1, 2
+  
+Unit 2 (Practice) - 10 minutes
+  Clusters: 3, 4
+  
+Unit 3 (Assessment)
+  Assessment Clusters: 0-4
+```
+
+This helps instructors and content creators understand the learning flow and pacing.
+
+## Tips for Content Creators
+
+1. **Start with verbose mode** during development to see detailed feedback
+2. **Use timeline reports** to visualize and verify learning progression
+3. **Test incrementally** - validate after adding each new unit or cluster
+4. **Check warnings carefully** - they often indicate potential student confusion
+5. **Validate media files** - missing media breaks the learning experience
+6. **Use descriptive filenames** - makes debugging easier
+
+## Integration with Build Systems
+
+### Makefile Example
+```makefile
+validate:
+	python3 package_validator.py package.zip
+
+validate-verbose:
+	python3 package_validator.py package.zip -v
+
+report:
+	python3 package_validator.py package.zip --timeline
+
+all: validate report
+```
+
+### GitHub Actions Example
+```yaml
+- name: Validate MoFaCTS Package
+  run: python3 package_validator.py dist/package.zip -v --timeline
+  
+- name: Upload Timeline Report
+  uses: actions/upload-artifact@v3
+  with:
+    name: timeline-report
+    path: dist/package_timeline.txt
+```
 
